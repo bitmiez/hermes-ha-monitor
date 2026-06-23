@@ -1,0 +1,16 @@
+[Unit]
+Description=Push Hermes host and Codex metrics to Home Assistant
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/hermes-ha-monitor.env
+Type=oneshot
+ExecStart=/opt/hermes-ha-monitor/hermes_ha_monitor.py
+User=root
+Group=root
+Nice=5
+IOSchedulingClass=best-effort
+ProtectSystem=full
+ReadWritePaths=/var/lib/hermes-ha-monitor /root/.cache /root/.codex/log
+PrivateTmp=true

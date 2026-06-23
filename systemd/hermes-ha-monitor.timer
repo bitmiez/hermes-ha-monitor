@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Hermes Home Assistant monitor live
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=2s
+AccuracySec=1s
+Persistent=true
+Unit=hermes-ha-monitor.service
+
+[Install]
+WantedBy=timers.target
