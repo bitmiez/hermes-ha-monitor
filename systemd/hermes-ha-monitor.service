@@ -1,5 +1,5 @@
 [Unit]
-Description=Push Hermes host and Codex metrics to Home Assistant
+Description=Publish Hermes host and Codex metrics via MQTT
 Wants=network-online.target
 After=network-online.target
 
