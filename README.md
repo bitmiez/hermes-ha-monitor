@@ -2,6 +2,10 @@
 
 Dark Home Assistant Lovelace card + Python collector for monitoring a Hermes/Codex host.
 
+![Hermes Monitor dashboard screenshot](docs/assets/hermes-monitor-dashboard.png)
+
+The screenshot shows the default dark Lovelace card with remaining Codex quota, server utilization, per-core CPU bars, and Auth1/Auth2 fallback status. Sensitive account data is redacted.
+
 ## Architecture
 
 ```text
@@ -28,6 +32,7 @@ systemd/hermes-ha-monitor.service    # oneshot service
 systemd/hermes-ha-monitor.timer      # ~2s timer
 homeassistant/hermes-monitor-card.yaml
 homeassistant/hermes-monitor-card.json
+docs/assets/hermes-monitor-dashboard.png
 .env.example
 ```
 
