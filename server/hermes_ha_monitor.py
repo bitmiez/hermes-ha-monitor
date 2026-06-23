@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Push Hermes host + OpenAI Codex status sensors into Home Assistant.
+"""Publish Hermes host + OpenAI Codex status sensors via MQTT Discovery.
 
-No secrets are printed. Home Assistant credentials are read from a .env file or environment variables.
+No secrets are printed. MQTT credentials are read from a root-only env file or environment variables.
 """
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ import pathlib
 import select
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -341,37 +343,97 @@ def mqtt_publish(base_url: str, token: str, topic: str, payload: Any, retain: bo
     MQTT_OUTBOX.append((topic, payload, retain))
 
 
+def _mqtt_varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n % 128
+        n //= 128
+        if n:
+            b |= 128
+        out.append(b)
+        if not n:
+            return bytes(out)
+
+
+def _mqtt_str(value: str) -> bytes:
+    raw = value.encode('utf-8')
+    return struct.pack('!H', len(raw)) + raw
+
+
+def _mqtt_packet(sock: socket.socket, packet_type_flags: int, payload: bytes) -> None:
+    sock.sendall(bytes([packet_type_flags]) + _mqtt_varint(len(payload)) + payload)
+
+
+def _mqtt_read_packet(sock: socket.socket) -> tuple[int, bytes]:
+    first = sock.recv(1)
+    if not first:
+        raise RuntimeError('MQTT broker closed connection')
+    multiplier = 1
+    remaining = 0
+    while True:
+        b = sock.recv(1)
+        if not b:
+            raise RuntimeError('MQTT broker closed connection while reading length')
+        digit = b[0]
+        remaining += (digit & 127) * multiplier
+        if not (digit & 128):
+            break
+        multiplier *= 128
+    data = bytearray()
+    while len(data) < remaining:
+        chunk = sock.recv(remaining - len(data))
+        if not chunk:
+            raise RuntimeError('MQTT broker closed connection while reading payload')
+        data.extend(chunk)
+    return first[0], bytes(data)
+
+
 def mqtt_flush(base_url: str, token: str) -> None:
     if not MQTT_OUTBOX:
         return
-    try:
-        import websocket as ws_client  # provided by websocket-client package
-        parsed = urllib.parse.urlparse(base_url.rstrip('/'))
-        url = ('wss' if parsed.scheme == 'https' else 'ws') + '://' + parsed.netloc + '/api/websocket'
-        ws = ws_client.create_connection(url, timeout=15)
-        ws.recv()
-        ws.send(json.dumps({'type': 'auth', 'access_token': token}))
-        ws.recv()
-        msg_id = 1
-        for topic, payload, retain in list(MQTT_OUTBOX):
-            ws.send(json.dumps({
-                'id': msg_id,
-                'type': 'call_service',
-                'domain': 'mqtt',
-                'service': 'publish',
-                'service_data': {'topic': topic, 'payload': payload, 'retain': retain},
-            }))
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                msg = json.loads(ws.recv())
-                if msg.get('id') == msg_id:
-                    break
-            msg_id += 1
-        ws.close()
-        MQTT_OUTBOX.clear()
-    except Exception:
-        # Keep legacy REST-created sensors working if MQTT path fails.
-        MQTT_OUTBOX.clear()
+    env = mqtt_env()
+    host = env.get('MQTT_HOST')
+    if not host:
+        raise RuntimeError('missing MQTT_HOST')
+    port = int(env.get('MQTT_PORT') or 1883)
+    username = env.get('MQTT_USERNAME')
+    password = env.get('MQTT_PASSWORD')
+    client_id = env.get('MQTT_CLIENT_ID') or ('hermes-ha-monitor-' + str(os.getpid()))
+    keepalive = int(env.get('MQTT_KEEPALIVE') or 60)
+
+    flags = 0x02  # clean session
+    payload = _mqtt_str(client_id)
+    if username:
+        flags |= 0x80
+        payload += _mqtt_str(username)
+    if password:
+        flags |= 0x40
+        payload += _mqtt_str(password)
+    variable = _mqtt_str('MQTT') + bytes([4, flags]) + struct.pack('!H', keepalive)
+
+    with socket.create_connection((host, port), timeout=10) as sock:
+        _mqtt_packet(sock, 0x10, variable + payload)
+        typ, data = _mqtt_read_packet(sock)
+        if typ != 0x20 or len(data) < 2 or data[1] != 0:
+            code = data[1] if len(data) >= 2 else 'missing'
+            raise RuntimeError(f'MQTT connect failed: {code}')
+        for topic, payload_text, retain in list(MQTT_OUTBOX):
+            body = _mqtt_str(topic) + payload_text.encode('utf-8')
+            _mqtt_packet(sock, 0x31 if retain else 0x30, body)
+        _mqtt_packet(sock, 0xE0, b'')
+    MQTT_OUTBOX.clear()
+
+
+def mqtt_env() -> dict[str, str]:
+    return {**load_env(ENV_PATH), **{k: v for k, v in os.environ.items() if k.startswith(('MQTT_', 'HERMES_', 'HOMEASSISTANT_', 'CODEX_'))}}
+
+
+def mqtt_topic_prefix() -> str:
+    return (mqtt_env().get('MQTT_TOPIC_PREFIX') or 'hermes/monitor').strip().strip('/') or 'hermes/monitor'
+
+
+def mqtt_state_topic() -> str:
+    return mqtt_topic_prefix() + '/state'
 
 
 def mqtt_discovery_config(entity_id: str, state: Any, attrs: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
@@ -380,7 +442,7 @@ def mqtt_discovery_config(entity_id: str, state: Any, attrs: dict[str, Any]) -> 
         return None
     raw_name = str((attrs or {}).get('friendly_name') or entity_id.replace('sensor.', '').replace('_', ' ').title())
     name = raw_name.removeprefix('Hermes ').removeprefix('OpenAI Codex ')
-    state_topic = 'hermes/monitor/state'
+    state_topic = mqtt_state_topic()
     cfg: dict[str, Any] = {
         'name': name,
         'unique_id': object_id,
@@ -406,18 +468,18 @@ def mqtt_discovery_config(entity_id: str, state: Any, attrs: dict[str, Any]) -> 
 
 def ha_put(base_url: str, token: str, entity_id: str, state: Any, attrs: dict[str, Any] | None = None) -> None:
     attrs = attrs or {}
-    data = json.dumps({'state': str(state), 'attributes': attrs}).encode()
-    req = urllib.request.Request(
-        base_url.rstrip('/') + '/api/states/' + entity_id,
-        data=data,
-        method='POST',
-        headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'},
-    )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        r.read()
+    if base_url and token:
+        data = json.dumps({'state': str(state), 'attributes': attrs}).encode()
+        req = urllib.request.Request(
+            base_url.rstrip('/') + '/api/states/' + entity_id,
+            data=data,
+            method='POST',
+            headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r.read()
 
-    # MQTT mirror: HA MQTT discovery + one retained aggregate JSON state topic.
-    # UI can subscribe to real MQTT entities while legacy REST sensors remain available.
+    # MQTT Discovery + one retained aggregate JSON state topic.
     if mqtt_object_id(entity_id):
         MQTT_STATE[entity_id] = {'state': str(state), 'attributes': attrs}
         if MQTT_DISCOVERY_DUE:
@@ -425,7 +487,6 @@ def ha_put(base_url: str, token: str, entity_id: str, state: Any, attrs: dict[st
             if disc:
                 cfg_topic, cfg_payload = disc
                 mqtt_publish(base_url, token, cfg_topic, cfg_payload, retain=True)
-
 
 def push_sensors(base_url: str, token: str) -> dict[str, Any]:
     global MQTT_DISCOVERY_DUE, MQTT_STATE
@@ -528,7 +589,7 @@ def push_sensors(base_url: str, token: str) -> dict[str, Any]:
         pushed.append('sensor.hermes_openai_codex_limit_state')
 
     if MQTT_STATE:
-        mqtt_publish(base_url, token, 'hermes/monitor/state', MQTT_STATE, retain=True)
+        mqtt_publish(base_url, token, mqtt_state_topic(), MQTT_STATE, retain=True)
     mqtt_flush(base_url, token)
     if MQTT_DISCOVERY_DUE:
         new_state['mqtt_discovery_at'] = now_ts
@@ -538,14 +599,14 @@ def push_sensors(base_url: str, token: str) -> dict[str, Any]:
 
 
 def main() -> int:
-    env = {**load_env(ENV_PATH), **{k: v for k, v in os.environ.items() if k.startswith(('HOMEASSISTANT_', 'HERMES_', 'CODEX_'))}}
+    env = mqtt_env()
     base_url = env.get('HOMEASSISTANT_URL')
     token = env.get('HOMEASSISTANT_TOKEN')
-    if not base_url or not token:
-        print('missing HOMEASSISTANT_URL or HOMEASSISTANT_TOKEN', file=sys.stderr)
+    if not env.get('MQTT_HOST') and not (base_url and token):
+        print('missing MQTT_HOST (or legacy HOMEASSISTANT_URL + HOMEASSISTANT_TOKEN)', file=sys.stderr)
         return 2
     try:
-        result = push_sensors(base_url, token)
+        result = push_sensors(base_url or '', token or '')
     except urllib.error.HTTPError as e:
         print(f'home assistant HTTP error: {e.code}', file=sys.stderr)
         return 3

@@ -4,8 +4,8 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-EnvironmentFile=-/etc/hermes-ha-monitor.env
 Type=oneshot
+EnvironmentFile=-/etc/hermes-ha-monitor.env
 ExecStart=/opt/hermes-ha-monitor/hermes_ha_monitor.py
 User=root
 Group=root
