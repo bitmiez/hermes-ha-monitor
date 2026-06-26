@@ -34,7 +34,6 @@ STATE_DIR = pathlib.Path(os.environ.get('HERMES_HA_STATE_DIR', '/var/lib/hermes-
 STATE_FILE = STATE_DIR / 'state.json'
 PRIMARY_AUTH_INDEX = int(os.environ.get('HERMES_PRIMARY_AUTH_INDEX', '1'))
 FALLBACK_AUTH_INDEX = int(os.environ.get('HERMES_FALLBACK_AUTH_INDEX', '2'))
-DEFAULT_ACTIVE_AUTH_INDEX = int(os.environ.get('HERMES_DEFAULT_ACTIVE_AUTH_INDEX', str(FALLBACK_AUTH_INDEX)))
 MQTT_OUTBOX: list[tuple[str, str, bool]] = []
 MQTT_STATE: dict[str, dict[str, Any]] = {}
 MQTT_DISCOVERY_DUE = False
@@ -370,10 +369,12 @@ def auth_pool_status() -> list[dict[str, Any]]:
         has_tokens = bool(e.get('access_token') and e.get('refresh_token'))
         fp_active = bool(
             has_tokens
+            and active_access_fp
+            and active_refresh_fp
             and token_fp(e.get('access_token')) == active_access_fp
             and token_fp(e.get('refresh_token')) == active_refresh_fp
         )
-        active = fp_active or idx == DEFAULT_ACTIVE_AUTH_INDEX
+        active = fp_active
         err_code = e.get('last_error_code')
         err_reason = e.get('last_error_reason')
         err_msg = e.get('last_error_message')
@@ -399,9 +400,12 @@ def auth_pool_status() -> list[dict[str, Any]]:
             'state': state,
             'login_ok': login_ok,
             'quota_429': quota_429,
-            'quota_state': '429' if quota_429 else 'ok',
+            # Do not claim per-auth quota health unless this pool entry is the exact
+            # active Codex CLI login. Codex app-server exposes quota for ~/.codex/auth.json
+            # only; non-matching pool entries are login metadata, not live quota sources.
+            'quota_state': '429' if quota_429 else ('live_ok' if active else 'unknown'),
             'active_codex_cli_login': active,
-            'active_match_method': 'token_fingerprint' if fp_active else ('configured_default_active' if idx == DEFAULT_ACTIVE_AUTH_INDEX else None),
+            'active_match_method': 'token_fingerprint' if fp_active else None,
             'live_quota_available': active,
             'source': e.get('source'),
             'last_status': e.get('last_status'),
@@ -697,12 +701,20 @@ def push_sensors(base_url: str, token: str) -> dict[str, Any]:
         pushed.extend([f'sensor.hermes_openai_codex_auth{idx}_state', f'sensor.hermes_openai_codex_auth{idx}_login', f'sensor.hermes_openai_codex_auth{idx}_quota_state'])
     primary_429 = bool((primary_auth or {}).get('quota_429'))
     runtime_429 = bool((recent_error or {}).get('quota_429'))
+    primary_active = bool((primary_auth or {}).get('active_codex_cli_login'))
+    fallback_active = bool((fallback_auth or {}).get('active_codex_cli_login'))
     fallback_login_ok = bool((fallback_auth or {}).get('login_ok'))
-    # Semantics: fallback is active only when primary Auth1 hit quota/429 and agents should use Auth2.
-    # A Codex CLI session using Auth2 is separate live-quota context, not fallback activation by itself.
-    fallback_active = bool(primary_429 and fallback_login_ok)
-    fallback_reason = 'primary_429_using_auth2' if fallback_active else ('primary_ok' if not primary_429 else 'fallback_login_not_ok')
-    ha_put(base_url, token, 'sensor.hermes_openai_codex_fallback_state', 'active' if fallback_active else 'inactive', {'friendly_name': 'OpenAI Codex Fallback', 'icon': 'mdi:backup-restore', 'primary_auth': primary_auth, 'fallback_auth': fallback_auth, 'primary_429': primary_429, 'runtime_429': runtime_429, 'recent_api_error': recent_error, 'recent_credential_rotation': recent_rotation, 'fallback_login_ok': fallback_login_ok, 'reason': fallback_reason})
+    active_auth = fallback_auth if fallback_active else (primary_auth if primary_active else None)
+    if fallback_active:
+        fallback_state = 'active'
+        fallback_reason = 'fallback_auth_is_active_codex_cli_login'
+    elif primary_active:
+        fallback_state = 'inactive'
+        fallback_reason = 'primary_auth_is_active_codex_cli_login'
+    else:
+        fallback_state = 'unknown'
+        fallback_reason = 'active_codex_cli_login_does_not_match_hermes_pool_tokens'
+    ha_put(base_url, token, 'sensor.hermes_openai_codex_fallback_state', fallback_state, {'friendly_name': 'OpenAI Codex Fallback', 'icon': 'mdi:backup-restore', 'primary_auth': primary_auth, 'fallback_auth': fallback_auth, 'active_auth': active_auth, 'primary_429': primary_429, 'runtime_429': runtime_429, 'recent_api_error': recent_error, 'recent_credential_rotation': recent_rotation, 'fallback_login_ok': fallback_login_ok, 'primary_active': primary_active, 'fallback_active': fallback_active, 'reason': fallback_reason, 'meaning': 'active = Auth2/fallback is the exact active Codex CLI login; inactive = Auth1/primary is active; unknown = Codex CLI tokens do not match any Hermes pool entry, so fallback use cannot be proven.'})
     pushed.append('sensor.hermes_openai_codex_fallback_state')
 
     account, rate, codex_error = run_codex_app_server()
