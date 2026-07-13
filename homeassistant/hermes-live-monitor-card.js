@@ -6,13 +6,21 @@ class HermesLiveMonitorCard extends HTMLElement {
   _state(id, fb='—') { return this._s(id)?.state ?? fb; }
   _attr(id, key, fb=null) { const a=this._s(id)?.attributes || {}; return a[key] ?? fb; }
   _numState(id) { const n=parseFloat(this._state(id, '0')); return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0; }
+  _quotaEntity(id) {
+    const legacy=id.replace('sensor.hermes_live_','sensor.hermes_');
+    const rest=this._s(legacy), live=this._s(id);
+    // REST mirror accepts non-numeric unknown states; MQTT numeric entities can keep stale values.
+    return rest || live;
+  }
+  _quotaAttr(id, key, fb=null) { const a=this._quotaEntity(id)?.attributes || {}; return a[key] ?? this._attr(id,key,fb); }
+  _quotaState(id) { const raw=this._quotaEntity(id)?.state ?? 'unknown'; const n=parseFloat(raw); return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : null; }
   _snap(key, fallbackId) { const n=parseFloat(this._attr('sensor.hermes_live_host_metrics_snapshot', key, this._state(fallbackId, '0'))); return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0; }
-  _pct(v) { return `${Math.round(v)}%`; }
+  _pct(v) { return v==null ? '—' : `${Math.round(v)}%`; }
   _hostColor(v) { return v >= 90 ? '#ff5f5f' : (v >= 75 ? '#f0b84a' : '#58d26b'); }
   _quotaColor(v) { return v >= 80 ? '#58d26b' : (v >= 35 ? '#f0b84a' : '#ff5f5f'); }
   _bar(label, id) {
-    const v=this._numState(id), r=this._attr(id,'reset_display',''); const c=this._quotaColor(v);
-    return `<div class="bar quota"><div class="barrow"><b>${label}</b><span>${this._pct(v)}</span><span>${r || ''}</span></div><div class="track"><div class="fill" style="width:${v}%;background:${c}"></div></div></div>`;
+    const v=this._quotaState(id), r=this._quotaAttr(id,'reset_display',''); const c=v==null ? '#777' : this._quotaColor(v); const w=v==null ? 0 : v;
+    return `<div class="bar quota"><div class="barrow"><b>${label}</b><span>${this._pct(v)}</span><span>${r || ''}</span></div><div class="track"><div class="fill" style="width:${w}%;background:${c}"></div></div></div>`;
   }
   _hostbar(label, key, fallbackId) {
     const v=this._snap(key, fallbackId), c=this._hostColor(v);

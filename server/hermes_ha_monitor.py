@@ -735,18 +735,32 @@ def push_sensors(base_url: str, token: str) -> dict[str, Any]:
         secondary = snap.get('secondary') or {}
         credits = snap.get('credits') or {}
         common = {'limitId': snap.get('limitId'), 'limitName': snap.get('limitName'), 'planType': snap.get('planType'), 'rateLimitReachedType': snap.get('rateLimitReachedType'), 'credits': credits, 'last_update': dt.datetime.now(dt.timezone.utc).isoformat()}
-        primary_used = primary.get('usedPercent')
-        secondary_used = secondary.get('usedPercent')
-        primary_remaining = 100 - primary_used if isinstance(primary_used, (int, float)) else 'unknown'
-        secondary_remaining = 100 - secondary_used if isinstance(secondary_used, (int, float)) else 'unknown'
-        primary_reset_display = local_reset_display(primary.get('resetsAt'), 'time')
-        secondary_reset_display = local_reset_display(secondary.get('resetsAt'), 'date')
-        ha_put(base_url, token, 'sensor.hermes_openai_codex_5h_used', primary.get('usedPercent', 'unknown'), {'friendly_name': 'OpenAI Codex 5h verbraucht', 'unit_of_measurement': '%', 'state_class': 'measurement', 'icon': 'mdi:timer-sand', 'windowDurationMins': primary.get('windowDurationMins'), 'resetsAt': iso_from_epoch(primary.get('resetsAt')), 'reset_display': primary_reset_display, **common})
-        ha_put(base_url, token, 'sensor.hermes_openai_codex_weekly_used', secondary.get('usedPercent', 'unknown'), {'friendly_name': 'OpenAI Codex Woche verbraucht', 'unit_of_measurement': '%', 'state_class': 'measurement', 'icon': 'mdi:calendar-week', 'windowDurationMins': secondary.get('windowDurationMins'), 'resetsAt': iso_from_epoch(secondary.get('resetsAt')), 'reset_display': secondary_reset_display, **common})
-        ha_put(base_url, token, 'sensor.hermes_openai_codex_5h_remaining', primary_remaining, {'friendly_name': 'OpenAI Codex 5h verbleibend', 'unit_of_measurement': '%', 'state_class': 'measurement', 'icon': 'mdi:speedometer', 'usedPercent': primary_used, 'windowDurationMins': primary.get('windowDurationMins'), 'resetsAt': iso_from_epoch(primary.get('resetsAt')), 'reset_display': primary_reset_display, **common})
-        ha_put(base_url, token, 'sensor.hermes_openai_codex_weekly_remaining', secondary_remaining, {'friendly_name': 'OpenAI Codex Woche verbleibend', 'unit_of_measurement': '%', 'state_class': 'measurement', 'icon': 'mdi:speedometer', 'usedPercent': secondary_used, 'windowDurationMins': secondary.get('windowDurationMins'), 'resetsAt': iso_from_epoch(secondary.get('resetsAt')), 'reset_display': secondary_reset_display, **common})
-        ha_put(base_url, token, 'sensor.hermes_openai_codex_5h_reset', iso_from_epoch(primary.get('resetsAt')) or 'unknown', {'friendly_name': 'OpenAI Codex 5h Reset', 'device_class': 'timestamp', 'icon': 'mdi:clock-end', 'reset_display': primary_reset_display, **common})
-        ha_put(base_url, token, 'sensor.hermes_openai_codex_weekly_reset', iso_from_epoch(secondary.get('resetsAt')) or 'unknown', {'friendly_name': 'OpenAI Codex Wochenreset', 'device_class': 'timestamp', 'icon': 'mdi:calendar-clock', 'reset_display': secondary_reset_display, **common})
+
+        # ChatGPT/Codex backend may return one or two windows, and labels are
+        # not stable: older responses used primary=5h and secondary=weekly;
+        # newer Plus responses can return only primary with windowDurationMins=10080
+        # (weekly). Map by duration, not by field position, to avoid showing
+        # missing weekly data as a fake 0%.
+        windows = [w for w in (primary, secondary) if isinstance(w, dict) and w]
+        five_hour = next((w for w in windows if w.get('windowDurationMins') in range(240, 361)), {})
+        weekly = next((w for w in windows if w.get('windowDurationMins') in range(9000, 11000)), {})
+        if not five_hour and primary.get('windowDurationMins') in (None, 0) and secondary:
+            five_hour = primary
+        if not weekly and secondary.get('windowDurationMins') in (None, 0):
+            weekly = secondary
+
+        five_used = five_hour.get('usedPercent')
+        weekly_used = weekly.get('usedPercent')
+        five_remaining = 100 - five_used if isinstance(five_used, (int, float)) else 'unknown'
+        weekly_remaining = 100 - weekly_used if isinstance(weekly_used, (int, float)) else 'unknown'
+        five_reset_display = local_reset_display(five_hour.get('resetsAt'), 'time')
+        weekly_reset_display = local_reset_display(weekly.get('resetsAt'), 'date')
+        ha_put(base_url, token, 'sensor.hermes_openai_codex_5h_used', five_hour.get('usedPercent', 'unknown'), {'friendly_name': 'OpenAI Codex 5h verbraucht', 'unit_of_measurement': '%', 'state_class': 'measurement', 'icon': 'mdi:timer-sand', 'windowDurationMins': five_hour.get('windowDurationMins'), 'resetsAt': iso_from_epoch(five_hour.get('resetsAt')), 'reset_display': five_reset_display, 'raw_primary_windowDurationMins': primary.get('windowDurationMins'), 'raw_secondary_windowDurationMins': secondary.get('windowDurationMins'), **common})
+        ha_put(base_url, token, 'sensor.hermes_openai_codex_weekly_used', weekly.get('usedPercent', 'unknown'), {'friendly_name': 'OpenAI Codex Woche verbraucht', 'unit_of_measurement': '%', 'state_class': 'measurement', 'icon': 'mdi:calendar-week', 'windowDurationMins': weekly.get('windowDurationMins'), 'resetsAt': iso_from_epoch(weekly.get('resetsAt')), 'reset_display': weekly_reset_display, 'raw_primary_windowDurationMins': primary.get('windowDurationMins'), 'raw_secondary_windowDurationMins': secondary.get('windowDurationMins'), **common})
+        ha_put(base_url, token, 'sensor.hermes_openai_codex_5h_remaining', five_remaining, {'friendly_name': 'OpenAI Codex 5h verbleibend', 'unit_of_measurement': '%', 'state_class': 'measurement', 'icon': 'mdi:speedometer', 'usedPercent': five_used, 'windowDurationMins': five_hour.get('windowDurationMins'), 'resetsAt': iso_from_epoch(five_hour.get('resetsAt')), 'reset_display': five_reset_display, 'raw_primary_windowDurationMins': primary.get('windowDurationMins'), 'raw_secondary_windowDurationMins': secondary.get('windowDurationMins'), **common})
+        ha_put(base_url, token, 'sensor.hermes_openai_codex_weekly_remaining', weekly_remaining, {'friendly_name': 'OpenAI Codex Woche verbleibend', 'unit_of_measurement': '%', 'state_class': 'measurement', 'icon': 'mdi:speedometer', 'usedPercent': weekly_used, 'windowDurationMins': weekly.get('windowDurationMins'), 'resetsAt': iso_from_epoch(weekly.get('resetsAt')), 'reset_display': weekly_reset_display, 'raw_primary_windowDurationMins': primary.get('windowDurationMins'), 'raw_secondary_windowDurationMins': secondary.get('windowDurationMins'), **common})
+        ha_put(base_url, token, 'sensor.hermes_openai_codex_5h_reset', iso_from_epoch(five_hour.get('resetsAt')) or 'unknown', {'friendly_name': 'OpenAI Codex 5h Reset', 'device_class': 'timestamp', 'icon': 'mdi:clock-end', 'reset_display': five_reset_display, **common})
+        ha_put(base_url, token, 'sensor.hermes_openai_codex_weekly_reset', iso_from_epoch(weekly.get('resetsAt')) or 'unknown', {'friendly_name': 'OpenAI Codex Wochenreset', 'device_class': 'timestamp', 'icon': 'mdi:calendar-clock', 'reset_display': weekly_reset_display, **common})
         reached = snap.get('rateLimitReachedType') or 'ok'
         ha_put(base_url, token, 'sensor.hermes_openai_codex_limit_state', reached, {'friendly_name': 'OpenAI Codex Limitstatus', 'icon': 'mdi:alert-circle-check', **common})
         pushed += ['sensor.hermes_openai_codex_5h_used', 'sensor.hermes_openai_codex_weekly_used', 'sensor.hermes_openai_codex_5h_remaining', 'sensor.hermes_openai_codex_weekly_remaining', 'sensor.hermes_openai_codex_5h_reset', 'sensor.hermes_openai_codex_weekly_reset', 'sensor.hermes_openai_codex_limit_state']
