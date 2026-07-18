@@ -30,6 +30,7 @@ ENV_PATH = pathlib.Path(os.environ.get('HERMES_HA_ENV_PATH', '/etc/hermes-ha-mon
 HERMES_AUTH = pathlib.Path(os.environ.get('HERMES_AUTH_PATH', '/root/.hermes/auth.json'))
 CODEX_AUTH = pathlib.Path(os.environ.get('CODEX_AUTH_PATH', '/root/.codex/auth.json'))
 CODEX_CONFIG = pathlib.Path(os.environ.get('CODEX_CONFIG_PATH', '/root/.codex/config.toml'))
+CODEX_ACCOUNTS_ROOT = pathlib.Path(os.environ.get('HERMES_CODEX_ACCOUNTS_ROOT', '/opt/hermes-ha-monitor/codex-accounts'))
 STATE_DIR = pathlib.Path(os.environ.get('HERMES_HA_STATE_DIR', '/var/lib/hermes-ha-monitor'))
 STATE_FILE = STATE_DIR / 'state.json'
 PRIMARY_AUTH_INDEX = int(os.environ.get('HERMES_PRIMARY_AUTH_INDEX', '1'))
@@ -184,6 +185,64 @@ def uptime_seconds() -> int | None:
         return int(float(pathlib.Path('/proc/uptime').read_text().split()[0]))
     except Exception:
         return None
+
+
+def _atomic_private_json(path: pathlib.Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, separators=(',', ':')))
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    os.chmod(path, 0o600)
+
+
+def sync_codex_account_homes(indices: list[int]) -> dict[int, str]:
+    """Sync Hermes OAuth pool entries to isolated Codex homes without touching ~/.codex."""
+    pool = (((read_json(HERMES_AUTH, {}) or {}).get('credential_pool') or {}).get('openai-codex') or [])
+    base_template = read_json(CODEX_AUTH, {}) or {}
+    result: dict[int, str] = {}
+    for idx in indices:
+        if idx < 1 or idx > len(pool):
+            result[idx] = 'pool_entry_missing'
+            continue
+        entry = pool[idx - 1]
+        if not entry.get('access_token') or not entry.get('refresh_token'):
+            result[idx] = 'pool_tokens_missing'
+            continue
+        auth_path = CODEX_ACCOUNTS_ROOT / f'auth{idx}' / 'auth.json'
+        existing = read_json(auth_path, {}) or {}
+        # Existing isolated home retains account_id/id_token if Codex has refreshed them.
+        auth = dict(existing or base_template)
+        tokens = dict((existing or base_template).get('tokens') or {})
+        tokens['access_token'] = entry['access_token']
+        tokens['refresh_token'] = entry['refresh_token']
+        auth['tokens'] = tokens
+        auth['auth_mode'] = 'chatgpt'
+        auth['OPENAI_API_KEY'] = None
+        auth['last_refresh'] = entry.get('last_refresh') or auth.get('last_refresh')
+        _atomic_private_json(auth_path, auth)
+        result[idx] = 'ok'
+    return result
+
+
+def codex_quota_windows(rate: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(rate, dict):
+        return None
+    by_id = rate.get('rateLimitsByLimitId') or {}
+    snap = by_id.get('codex') or rate.get('rateLimits')
+    if not isinstance(snap, dict):
+        return None
+    primary = snap.get('primary') or {}
+    secondary = snap.get('secondary') or {}
+    windows = [w for w in (primary, secondary) if isinstance(w, dict) and w]
+    five_hour = next((w for w in windows if w.get('windowDurationMins') in range(240, 361)), {})
+    weekly = next((w for w in windows if w.get('windowDurationMins') in range(9000, 11000)), {})
+    if not five_hour and primary.get('windowDurationMins') in (None, 0) and secondary:
+        five_hour = primary
+    if not weekly and secondary.get('windowDurationMins') in (None, 0):
+        weekly = secondary
+    return {'snap': snap, 'primary': primary, 'secondary': secondary, 'five_hour': five_hour, 'weekly': weekly}
 
 
 def run_codex_app_server(codex_home: str | None = None, timeout: float = 15) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
@@ -565,6 +624,10 @@ def mqtt_discovery_config(entity_id: str, state: Any, attrs: dict[str, Any]) -> 
         },
     }
     for k in ('unit_of_measurement', 'device_class', 'state_class'):
+        # HA rejects non-numeric MQTT states for measurement-class sensors.
+        # Codex rate endpoints can legitimately be unknown; do not retain stale values.
+        if k == 'state_class' and object_id.startswith('hermes_live_openai_codex_'):
+            continue
         if (attrs or {}).get(k) is not None:
             cfg[k] = attrs[k]
     # CPU bars should move every collector tick, even when rounded state repeats.
@@ -604,6 +667,45 @@ def ha_put(base_url: str, token: str, entity_id: str, state: Any, attrs: dict[st
                 cfg_topic, cfg_payload = disc
                 mqtt_publish(base_url, token, cfg_topic, cfg_payload, retain=True)
 
+def publish_account_quota(base_url: str, token: str, idx: int, account: dict[str, Any] | None, rate: dict[str, Any] | None, error: str | None) -> list[str]:
+    """Publish isolated live quota for one Hermes pool account. No email/tokens in attrs."""
+    prefix = f'sensor.hermes_openai_codex_auth{idx}'
+    windows = codex_quota_windows(rate)
+    acct = (account or {}).get('account') if isinstance(account, dict) else {}
+    plan = acct.get('planType') if isinstance(acct, dict) else None
+    pushed: list[str] = []
+    if windows:
+        snap = windows['snap']
+        common = {
+            'auth_index': idx, 'planType': plan or snap.get('planType'),
+            'limitId': snap.get('limitId'), 'rateLimitReachedType': snap.get('rateLimitReachedType'),
+            'last_update': dt.datetime.now(dt.timezone.utc).isoformat(), 'isolated_codex_home': True,
+        }
+        for name, window, icon, title, display_mode in (
+            ('5h', windows['five_hour'], 'mdi:timer-sand', '5h', 'time'),
+            ('weekly', windows['weekly'], 'mdi:calendar-week', 'Woche', 'date'),
+        ):
+            used = window.get('usedPercent')
+            remaining = 100 - used if isinstance(used, (int, float)) else 'unknown'
+            reset = window.get('resetsAt')
+            attrs = {'friendly_name': f'OpenAI Codex Auth{idx} {title} verbleibend', 'unit_of_measurement': '%', 'state_class': 'measurement', 'icon': 'mdi:speedometer', 'usedPercent': used, 'windowDurationMins': window.get('windowDurationMins'), 'resetsAt': iso_from_epoch(reset), 'reset_display': local_reset_display(reset, display_mode), **common}
+            used_attrs = {**attrs, 'friendly_name': f'OpenAI Codex Auth{idx} {title} verbraucht', 'icon': icon}
+            ha_put(base_url, token, f'{prefix}_{name}_remaining', remaining, attrs)
+            ha_put(base_url, token, f'{prefix}_{name}_used', used if isinstance(used, (int, float)) else 'unknown', used_attrs)
+            pushed.extend([f'{prefix}_{name}_remaining', f'{prefix}_{name}_used'])
+        state = snap.get('rateLimitReachedType') or 'ok'
+        ha_put(base_url, token, f'{prefix}_quota_probe', state, {'friendly_name': f'OpenAI Codex Auth{idx} Live Quota', 'icon': 'mdi:check-circle-outline', **common})
+    else:
+        common = {'auth_index': idx, 'last_update': dt.datetime.now(dt.timezone.utc).isoformat(), 'isolated_codex_home': True, 'error': error or 'no rate response'}
+        for name, title in (('5h', '5h'), ('weekly', 'Woche')):
+            ha_put(base_url, token, f'{prefix}_{name}_remaining', 'unknown', {'friendly_name': f'OpenAI Codex Auth{idx} {title} verbleibend', 'unit_of_measurement': '%', 'icon': 'mdi:speedometer', **common})
+            ha_put(base_url, token, f'{prefix}_{name}_used', 'unknown', {'friendly_name': f'OpenAI Codex Auth{idx} {title} verbraucht', 'unit_of_measurement': '%', 'icon': 'mdi:timer-sand' if name == '5h' else 'mdi:calendar-week', **common})
+            pushed.extend([f'{prefix}_{name}_remaining', f'{prefix}_{name}_used'])
+        ha_put(base_url, token, f'{prefix}_quota_probe', 'error', {'friendly_name': f'OpenAI Codex Auth{idx} Live Quota', 'icon': 'mdi:alert-circle', **common})
+    pushed.append(f'{prefix}_quota_probe')
+    return pushed
+
+
 def push_sensors(base_url: str, token: str) -> dict[str, Any]:
     global MQTT_DISCOVERY_DUE, MQTT_STATE
     prev = read_json(STATE_FILE, {})
@@ -612,6 +714,7 @@ def push_sensors(base_url: str, token: str) -> dict[str, Any]:
     MQTT_DISCOVERY_DUE = now_ts - float(prev.get('mqtt_discovery_at') or 0) > 600
     new_state: dict[str, Any] = {}
     pushed: list[str] = []
+    live_unknown_updates: list[tuple[str, dict[str, Any]]] = []
     sample_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
     cpu, cpu_state = cpu_percent(prev)
@@ -717,6 +820,15 @@ def push_sensors(base_url: str, token: str) -> dict[str, Any]:
     ha_put(base_url, token, 'sensor.hermes_openai_codex_fallback_state', fallback_state, {'friendly_name': 'OpenAI Codex Fallback', 'icon': 'mdi:backup-restore', 'primary_auth': primary_auth, 'fallback_auth': fallback_auth, 'active_auth': active_auth, 'primary_429': primary_429, 'runtime_429': runtime_429, 'recent_api_error': recent_error, 'recent_credential_rotation': recent_rotation, 'fallback_login_ok': fallback_login_ok, 'primary_active': primary_active, 'fallback_active': fallback_active, 'reason': fallback_reason, 'meaning': 'active = Auth2/fallback is the exact active Codex CLI login; inactive = Auth1/primary is active; unknown = Codex CLI tokens do not match any Hermes pool entry, so fallback use cannot be proven.'})
     pushed.append('sensor.hermes_openai_codex_fallback_state')
 
+    # Per-account quotas use isolated CODEX_HOME dirs, so both accounts are
+    # measured without switching the global Codex CLI login used by Hermes.
+    configured_indices = sorted({PRIMARY_AUTH_INDEX, FALLBACK_AUTH_INDEX})
+    home_sync = sync_codex_account_homes(configured_indices)
+    for idx in configured_indices:
+        home = CODEX_ACCOUNTS_ROOT / f'auth{idx}'
+        account_i, rate_i, err_i = (None, None, home_sync[idx]) if home_sync.get(idx) != 'ok' else run_codex_app_server(str(home))
+        pushed.extend(publish_account_quota(base_url, token, idx, account_i, rate_i, err_i))
+
     account, rate, codex_error = run_codex_app_server()
     acct_obj = (account or {}).get('account') if isinstance(account, dict) else None
     if acct_obj:
@@ -764,13 +876,47 @@ def push_sensors(base_url: str, token: str) -> dict[str, Any]:
         reached = snap.get('rateLimitReachedType') or 'ok'
         ha_put(base_url, token, 'sensor.hermes_openai_codex_limit_state', reached, {'friendly_name': 'OpenAI Codex Limitstatus', 'icon': 'mdi:alert-circle-check', **common})
         pushed += ['sensor.hermes_openai_codex_5h_used', 'sensor.hermes_openai_codex_weekly_used', 'sensor.hermes_openai_codex_5h_remaining', 'sensor.hermes_openai_codex_weekly_remaining', 'sensor.hermes_openai_codex_5h_reset', 'sensor.hermes_openai_codex_weekly_reset', 'sensor.hermes_openai_codex_limit_state']
+        # Response can contain only one window; clear stale values for the absent one.
+        for prefix, label, used, reset_icon in (
+            ('5h', '5h', five_used, 'mdi:clock-end'),
+            ('weekly', 'Woche', weekly_used, 'mdi:calendar-clock'),
+        ):
+            if isinstance(used, (int, float)):
+                continue
+            live_unknown_updates.extend([
+                (f'sensor.hermes_live_openai_codex_{prefix}_used', {'friendly_name': f'Hermes Monitor OpenAI Codex {label} verbraucht', 'unit_of_measurement': '%', 'icon': 'mdi:timer-sand' if prefix == '5h' else 'mdi:calendar-week', 'last_update': common['last_update']}),
+                (f'sensor.hermes_live_openai_codex_{prefix}_remaining', {'friendly_name': f'Hermes Monitor OpenAI Codex {label} verbleibend', 'unit_of_measurement': '%', 'icon': 'mdi:speedometer', 'last_update': common['last_update']}),
+                (f'sensor.hermes_live_openai_codex_{prefix}_reset', {'friendly_name': f'Hermes Monitor OpenAI Codex {label} Reset', 'device_class': 'timestamp', 'icon': reset_icon, 'last_update': common['last_update']}),
+            ])
     else:
-        ha_put(base_url, token, 'sensor.hermes_openai_codex_limit_state', 'unknown', {'friendly_name': 'OpenAI Codex Limitstatus', 'icon': 'mdi:alert-circle', 'error': codex_error})
+        unavailable = {'error': codex_error, 'last_update': dt.datetime.now(dt.timezone.utc).isoformat()}
+        for entity_id, name, icon, device_class in (
+            ('sensor.hermes_openai_codex_5h_used', 'OpenAI Codex 5h verbraucht', 'mdi:timer-sand', None),
+            ('sensor.hermes_openai_codex_weekly_used', 'OpenAI Codex Woche verbraucht', 'mdi:calendar-week', None),
+            ('sensor.hermes_openai_codex_5h_remaining', 'OpenAI Codex 5h verbleibend', 'mdi:speedometer', None),
+            ('sensor.hermes_openai_codex_weekly_remaining', 'OpenAI Codex Woche verbleibend', 'mdi:speedometer', None),
+            ('sensor.hermes_openai_codex_5h_reset', 'OpenAI Codex 5h Reset', 'mdi:clock-end', 'timestamp'),
+            ('sensor.hermes_openai_codex_weekly_reset', 'OpenAI Codex Wochenreset', 'mdi:calendar-clock', 'timestamp'),
+        ):
+            attrs = {'friendly_name': name, 'icon': icon, **unavailable}
+            if device_class:
+                attrs['device_class'] = device_class
+            else:
+                attrs['unit_of_measurement'] = '%'
+                attrs['state_class'] = 'measurement'
+            ha_put(base_url, token, entity_id, 'unknown', attrs)
+            live_entity_id = 'sensor.hermes_live_' + entity_id.removeprefix('sensor.hermes_')
+            live_unknown_updates.append((live_entity_id, attrs))
+            pushed.append(entity_id)
+        ha_put(base_url, token, 'sensor.hermes_openai_codex_limit_state', 'unknown', {'friendly_name': 'OpenAI Codex Limitstatus', 'icon': 'mdi:alert-circle', **unavailable})
         pushed.append('sensor.hermes_openai_codex_limit_state')
 
     if MQTT_STATE:
         mqtt_publish(base_url, token, mqtt_state_topic(), MQTT_STATE, retain=True)
     mqtt_flush(base_url, token)
+    # Apply REST corrections after MQTT flush; delayed MQTT cannot reassert stale values.
+    for live_entity_id, attrs in live_unknown_updates:
+        ha_put(base_url, token, live_entity_id, 'unknown', attrs)
     if MQTT_DISCOVERY_DUE:
         new_state['mqtt_discovery_at'] = now_ts
     new_state['last_run'] = dt.datetime.now(dt.timezone.utc).isoformat()
